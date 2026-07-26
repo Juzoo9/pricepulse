@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - pricepulse_data:/app/pricepulse.db
+    restart: unless-stopped
+
+volumes:
+  pricepulse_data:

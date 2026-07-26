@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.db
+*.png
+.venv/
+node_modules/
+test_*.py
+test_report.txt
