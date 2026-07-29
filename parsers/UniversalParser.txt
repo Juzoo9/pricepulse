@@ -1,0 +1,66 @@
+# parsers/universal_browser_parser.py
+import re
+from typing import Optional, Dict
+from .browserwing_client import BrowserWingClient
+
+
+class UniversalBrowserParser:
+    """Универсальный парсер через BrowserWing. Работает с ЛЮБЫМ сайтом."""
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    async def parse(self, url: str, selectors: Dict[str, str]) -> Optional[Dict]:
+        """
+        Парсит любой сайт по CSS-селекторам.
+        
+        selectors = {
+            "name": "h1",
+            "price": ".price",
+            "image": "img.main-image"
+        }
+        """
+        try:
+            ok = await self.browser.navigate(url, wait=5.0)
+            if not ok:
+                return None
+
+            result = {"url": url, "source": "universal"}
+            
+            for field, selector in selectors.items():
+                script = f"""
+                    const el = document.querySelector('{selector}');
+                    return el ? el.innerText.trim() : null;
+                """
+                value = await self.browser.execute_js(script)
+                result[field] = value or "Не найдено"
+
+            # Очистка цены
+            if "price" in result and result["price"]:
+                digits = re.sub(r"[^\d]", "", str(result["price"]))
+                result["price"] = int(digits) if digits else None
+
+            return result
+
+        except Exception as e:
+            print(f"[UniversalParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    async def parse_custom_js(self, url: str, js_script: str) -> Optional[Dict]:
+        """
+        Для сложных сайтов — передаёшь свой JS.
+        """
+        try:
+            await self.browser.navigate(url, wait=5.0)
+            result = await self.browser.execute_js(js_script)
+            if isinstance(result, str):
+                import json
+                return json.loads(result)
+            return result
+        except Exception as e:
+            print(f"[UniversalParser] Ошибка JS: {e}")
+            return None
+        finally:
+            await self.browser.close()

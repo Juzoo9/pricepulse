@@ -16,7 +16,7 @@ class WildberriesParser:
         self.client = BrowserProxyClient()
         self.notifier = notifier or CaptchaNotifier()
 
-    def is_valid(self, url: str) -> bool:
+    async def is_valid(self, url: str) -> bool:
         return any(re.match(p, url) for p in self.PATTERNS)
 
     async def parse(self, url: str) -> Optional[Dict]:
