@@ -12,10 +12,23 @@ async def check_all_products(bot: Bot):
     for product in products:
         try:
             result = await parse_url(product.url)
+
+            if isinstance(result, dict) and result.get("error") == "out_of_stock":
+                await bot.send_message(
+                    chat_id=product.user_id,
+                    text=(
+                        f"\U0001f4ed <b>{product.title}</b>\n\n"
+                        f"Товар временно отсутствует в продаже.\n"
+                        f"<a href='{product.url}'>Посмотреть на сайте</a>"
+                    ),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                continue
+
+            new_price = result["price"]
         except Exception:
             continue
-
-        new_price = result["price"]
         old_price = product.current_price
 
         if new_price == old_price:

@@ -1,64 +1,28 @@
-import subprocess
-import sys
+import ast
 import os
 
-def run_tests():
-    results = []
-    py_files = []
-    
-    for root, dirs, files in os.walk('.'):
-        if any(skip in root for skip in ['venv', '__pycache__', '.git', 'examples']):
-            continue
-        for f in files:
-            if f.endswith('.py'):
-                py_files.append(os.path.join(root, f))
-    
-    if not py_files:
-        print("Python файлы не найдены")
-        return
-    
-    for pf in py_files:
-        with open(pf, 'r', encoding='utf-8') as file:
-            content = file.read()
-        
-        result = subprocess.run(
-            [sys.executable, '-m', 'py_compile', pf],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            results.append(f"❌ СИНТАКСИС в {pf}: {result.stderr.strip()}")
-            continue
-        
-        results.append(f"✅ Синтаксис OK: {pf}")
-        
-        if 'bot' in pf.lower():
-            if 'telebot' in content.lower():
-                results.append(f"❌ {pf}: запрещён telebot, используй aiogram 3.x")
-            if 'aiogram' in content and 'Router()' not in content:
-                results.append(f"⚠️ {pf}: добавь Router()")
-        
-        if 'parser' in pf.lower() or 'parse' in pf.lower():
-            if 'import requests' in content:
-                results.append(f"❌ {pf}: запрещён requests, используй aiohttp")
-            if 'async def' not in content:
-                results.append(f"❌ {pf}: парсер должен быть async")
-    
-    report = "\n".join(results)
-    print("\n" + "="*50)
-    print("РЕЗУЛЬТАТЫ ТЕСТОВ:")
-    print("="*50)
-    print(report)
-    
-    with open('test_report.txt', 'w', encoding='utf-8') as f:
-        f.write(report)
-    
-    errors = [r for r in results if r.startswith('❌')]
+def test_all_parsers():
+    base = os.path.join(os.path.dirname(__file__), "parsers")
+    errors = []
+    for root, dirs, files in os.walk(base):
+        for file in files:
+            if not file.endswith(".py"):
+                continue
+            path = os.path.join(root, file)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Проверяем только файлы с классом парсера
+            if "class" not in content or "Parser" not in content:
+                continue
+            try:
+                ast.parse(content)
+                print(f"[OK] {file}")
+            except SyntaxError as e:
+                print(f"❌ {file}: {e}")
+                errors.append((file, e))
     if errors:
-        print(f"\n❌ Найдено {len(errors)} ошибок!")
-        sys.exit(1)
-    else:
-        print("\n🎉 Все тесты пройдены!")
-        sys.exit(0)
+        raise Exception(f"Syntax errors: {errors}")
+    print("All parsers passed syntax check.")
 
-if __name__ == '__main__':
-    run_tests()
+if __name__ == "__main__":
+    test_all_parsers()

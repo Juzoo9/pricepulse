@@ -6,3 +6,6 @@ __pycache__/
 node_modules/
 test_*.py
 test_report.txt
+
+# Browser Proxy
+chrome_profile/

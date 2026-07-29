@@ -1,0 +1,978 @@
+Проект: C:\projects\pricepulse
+Браузер: BrowserWing запущен на http://127.0.0.1:8080, работает через Executor API (REST, не MCP).
+Задача: создать/перезаписать файлы парсеров, фабрику, универсальный парсер, а также модули экспорта в Excel и Google Sheets. Всё должно быть асинхронным (async/await). После написания кода — самостоятельно запусти тест из пункта 12 и покажи вывод.
+
+=== ФАЙЛ 1: parsers/browserwing_client.py (перезаписать полностью) ===
+
+import httpx
+import asyncio
+import json
+from typing import Optional, Dict, Any
+
+
+class BrowserWingClient:
+    """Клиент для BrowserWing Executor API."""
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8080/api/v1"):
+        self.client = httpx.AsyncClient(base_url=base_url, timeout=60.0)
+
+    async def navigate(self, url: str, wait: float = 5.0) -> bool:
+        try:
+            response = await self.client.post("/executor/navigate", json={"url": url})
+            response.raise_for_status()
+            await asyncio.sleep(wait)
+            return True
+        except Exception as e:
+            print(f"[BrowserWing] Ошибка navigate: {e}")
+            return False
+
+    async def execute_js(self, script: str) -> Any:
+        try:
+            response = await self.client.post("/executor/execute_script", json={"script": script})
+            response.raise_for_status()
+            data = response.json()
+            return data
+        except Exception as e:
+            print(f"[BrowserWing] Ошибка execute_js: {e}")
+            return None
+
+    async def snapshot(self) -> Dict[str, Any]:
+        try:
+            response = await self.client.get("/executor/snapshot")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"[BrowserWing] Ошибка snapshot: {e}")
+            return {}
+
+    async def close(self):
+        await self.client.aclose()
+
+
+=== ФАЙЛ 2: parsers/universal_browser_parser.py (создать) ===
+
+import re
+import asyncio
+from typing import Optional, Dict, Any
+from .browserwing_client import BrowserWingClient
+
+
+class UniversalBrowserParser:
+    """Универсальный парсер для любого сайта через BrowserWing."""
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    async def parse(self, url: str, selectors: Dict[str, str]) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=5.0)
+            if not ok:
+                return None
+
+            result = {"url": url, "source": "universal"}
+            for field, selector in selectors.items():
+                script = f"""
+                    const el = document.querySelector('{selector}');
+                    return el ? el.innerText.trim() : null;
+                """
+                value = await self.browser.execute_js(script)
+                result[field] = value if value else "Не найдено"
+
+            if "price" in result and result["price"] and result["price"] != "Не найдено":
+                digits = re.sub(r"[^\d]", "", str(result["price"]))
+                result["price"] = int(digits) if digits else None
+            else:
+                result["price"] = None
+
+            if "old_price" in result and result["old_price"] and result["old_price"] != "Не найдено":
+                digits = re.sub(r"[^\d]", "", str(result["old_price"]))
+                result["old_price"] = int(digits) if digits else None
+            else:
+                result["old_price"] = None
+
+            return result
+        except Exception as e:
+            print(f"[UniversalParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    async def parse_with_js(self, url: str, js_script: str) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=5.0)
+            if not ok:
+                return None
+            result = await self.browser.execute_js(js_script)
+            if isinstance(result, str):
+                import json
+                return json.loads(result)
+            return result
+        except Exception as e:
+            print(f"[UniversalParser] Ошибка JS: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+
+=== ФАЙЛ 3: parsers/ozon.py (перезаписать полностью) ===
+
+import re
+import json
+import asyncio
+from typing import Optional, Dict, Any
+from .browserwing_client import BrowserWingClient
+
+
+class OzonParser:
+    PATTERNS = [
+        r"https?://(?:www\.)?ozon\.ru/.*",
+        r"https?://(?:www\.)?ozon\.ru/t/.*",
+    ]
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=7.0)
+            if not ok:
+                return None
+
+            product = await self._extract_jsonld()
+            if product:
+                return product
+
+            product = await self._extract_nuxt()
+            if product:
+                return product
+
+            product = await self._extract_dom()
+            if product:
+                return product
+
+            print("[OzonParser] Не удалось извлечь данные")
+            return None
+        except Exception as e:
+            print(f"[OzonParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    async def _extract_jsonld(self) -> Optional[Dict]:
+        script = """
+            const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+            for (const s of scripts) {
+                try {
+                    const data = JSON.parse(s.textContent);
+                    if (data['@type'] === 'Product') return JSON.stringify(data);
+                    if (Array.isArray(data)) {
+                        const p = data.find(x => x['@type'] === 'Product');
+                        if (p) return JSON.stringify(p);
+                    }
+                } catch(e) {}
+            }
+            return null;
+        """
+        result = await self.browser.execute_js(script)
+        if not result:
+            return None
+        try:
+            data = json.loads(result) if isinstance(result, str) else result
+            offers = data.get("offers", {})
+            if isinstance(offers, list) and offers:
+                offers = offers[0]
+            elif not isinstance(offers, dict):
+                offers = {}
+            img = data.get("image", "")
+            if isinstance(img, list) and img:
+                img = img[0]
+            return {
+                "name": data.get("name", "Неизвестно"),
+                "price": self._clean_price(offers.get("price")),
+                "old_price": self._clean_price(offers.get("highPrice")),
+                "image": img or "",
+                "url": data.get("url", ""),
+                "source": "ozon",
+            }
+        except Exception as e:
+            print(f"[OzonParser] JSON-LD ошибка: {e}")
+            return None
+
+    async def _extract_nuxt(self) -> Optional[Dict]:
+        script = """
+            if (window.__NUXT__ && window.__NUXT__.state) {
+                return JSON.stringify(window.__NUXT__.state);
+            }
+            return null;
+        """
+        result = await self.browser.execute_js(script)
+        if not result:
+            return None
+        try:
+            state = json.loads(result) if isinstance(result, str) else result
+            product = self._find_in_state(state)
+            if not product:
+                return None
+            return {
+                "name": product.get("name", product.get("title", "Неизвестно")),
+                "price": self._clean_price(product.get("price") or product.get("finalPrice")),
+                "old_price": self._clean_price(product.get("oldPrice") or product.get("originalPrice")),
+                "image": product.get("image", product.get("coverImage", "")),
+                "url": product.get("url", ""),
+                "source": "ozon",
+            }
+        except Exception as e:
+            print(f"[OzonParser] NUXT ошибка: {e}")
+            return None
+
+    def _find_in_state(self, obj: Any) -> Optional[Dict]:
+        if not isinstance(obj, dict):
+            return None
+        if "name" in obj and ("price" in obj or "finalPrice" in obj):
+            return obj
+        for v in obj.values():
+            if isinstance(v, dict):
+                found = self._find_in_state(v)
+                if found:
+                    return found
+            elif isinstance(v, list):
+                for item in v:
+                    found = self._find_in_state(item)
+                    if found:
+                        return found
+        return None
+
+    async def _extract_dom(self) -> Optional[Dict]:
+        script = """
+            const nameEl = document.querySelector('h1') || document.querySelector('[data-widget="webProductHeading"] h1');
+            const priceEl = document.querySelector('span[data-testid="price"]') || document.querySelector('[data-widget="webPrice"] span');
+            const oldPriceEl = document.querySelector('span[data-testid="old-price"]');
+            const imgEl = document.querySelector('img[data-testid="image"]');
+            return JSON.stringify({
+                name: nameEl ? nameEl.innerText.trim() : null,
+                price: priceEl ? priceEl.innerText.trim() : null,
+                old_price: oldPriceEl ? oldPriceEl.innerText.trim() : null,
+                image: imgEl ? imgEl.src : null
+            });
+        """
+        result = await self.browser.execute_js(script)
+        if not result:
+            return None
+        try:
+            data = json.loads(result) if isinstance(result, str) else result
+            return {
+                "name": data.get("name") or "Неизвестно",
+                "price": self._clean_price(data.get("price")),
+                "old_price": self._clean_price(data.get("old_price")),
+                "image": data.get("image") or "",
+                "url": "",
+                "source": "ozon",
+            }
+        except Exception:
+            return None
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.browser.close()
+
+
+=== ФАЙЛ 4: parsers/wildberries.py (перезаписать полностью) ===
+
+import re
+import json
+import asyncio
+from typing import Optional, Dict
+from .browserwing_client import BrowserWingClient
+
+
+class WildberriesParser:
+    PATTERNS = [
+        r"https?://(?:www\.)?wildberries\.ru/catalog/\d+/detail\.aspx.*",
+        r"https?://(?:www\.)?wildberries\.ru/.*",
+    ]
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=6.0)
+            if not ok:
+                return None
+
+            script = """
+                try {
+                    const p = window.__INITIAL_STATE__?.catalog?.product;
+                    if (p) return JSON.stringify(p);
+                    return null;
+                } catch(e) { return null; }
+            """
+            result = await self.browser.execute_js(script)
+            if not result:
+                return await self._extract_from_dom()
+
+            data = json.loads(result) if isinstance(result, str) else result
+            price_raw = data.get("salePriceU") or data.get("price") or data.get("priceU")
+            price = int(price_raw) / 100 if price_raw else None
+
+            old_raw = data.get("priceU") or data.get("oldPrice")
+            old_price = int(old_raw) / 100 if old_raw else None
+
+            return {
+                "name": data.get("name", data.get("goodsName", "Неизвестно")),
+                "price": price,
+                "old_price": old_price,
+                "image": data.get("image", ""),
+                "url": url,
+                "source": "wildberries",
+            }
+        except Exception as e:
+            print(f"[WildberriesParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    async def _extract_from_dom(self) -> Optional[Dict]:
+        script = """
+            const nameEl = document.querySelector('h1') || document.querySelector('.product-page__title');
+            const priceEl = document.querySelector('.price-block__final-price') || document.querySelector('[data-testid="price"]');
+            const imgEl = document.querySelector('.photo-zoom__preview') || document.querySelector('img[data-testid="image"]');
+            return JSON.stringify({
+                name: nameEl ? nameEl.innerText.trim() : null,
+                price: priceEl ? priceEl.innerText.trim() : null,
+                image: imgEl ? imgEl.src : null
+            });
+        """
+        result = await self.browser.execute_js(script)
+        if not result:
+            return None
+        try:
+            data = json.loads(result) if isinstance(result, str) else result
+            return {
+                "name": data.get("name") or "Неизвестно",
+                "price": self._clean_price(data.get("price")),
+                "old_price": None,
+                "image": data.get("image") or "",
+                "url": "",
+                "source": "wildberries",
+            }
+        except Exception:
+            return None
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.browser.close()
+
+
+=== ФАЙЛ 5: parsers/yandex_market.py (создать) ===
+
+import re
+import asyncio
+from typing import Optional, Dict
+from .browserwing_client import BrowserWingClient
+
+
+class YandexMarketParser:
+    PATTERNS = [
+        r"https?://(?:www\.)?market\.yandex\.ru/.*",
+    ]
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=6.0)
+            if not ok:
+                return None
+
+            script = """
+                const nameEl = document.querySelector('h1[data-auto="productCardTitle"]') || document.querySelector('h1');
+                const priceEl = document.querySelector('span[data-auto="mainPrice"]') || document.querySelector('div[data-auto="price"]') || document.querySelector('span');
+                const imgEl = document.querySelector('img[data-auto="image"]') || document.querySelector('div[data-auto="gallery"] img');
+                return JSON.stringify({
+                    name: nameEl ? nameEl.innerText.trim() : null,
+                    price: priceEl ? priceEl.innerText.trim() : null,
+                    image: imgEl ? imgEl.src : null
+                });
+            """
+            result = await self.browser.execute_js(script)
+            if not result:
+                return None
+            try:
+                data = json.loads(result) if isinstance(result, str) else result
+                return {
+                    "name": data.get("name") or "Неизвестно",
+                    "price": self._clean_price(data.get("price")),
+                    "old_price": None,
+                    "image": data.get("image") or "",
+                    "url": url,
+                    "source": "yandex_market",
+                }
+            except Exception:
+                return None
+        except Exception as e:
+            print(f"[YandexMarketParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.browser.close()
+
+
+=== ФАЙЛ 6: parsers/lamoda.py (создать) ===
+
+import re
+import asyncio
+from typing import Optional, Dict
+from .browserwing_client import BrowserWingClient
+
+
+class LamodaParser:
+    PATTERNS = [
+        r"https?://(?:www\.)?lamoda\.ru/.*",
+    ]
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=5.0)
+            if not ok:
+                return None
+
+            script = """
+                const nameEl = document.querySelector('h1.product-title') || document.querySelector('h1');
+                const priceEl = document.querySelector('span.price') || document.querySelector('div.product-prices__price') || document.querySelector('span[itemprop="price"]');
+                const oldPriceEl = document.querySelector('span.price__old') || document.querySelector('div.product-prices__price-old');
+                const imgEl = document.querySelector('img.product-gallery__image') || document.querySelector('meta[property="og:image"]');
+                return JSON.stringify({
+                    name: nameEl ? nameEl.innerText.trim() : null,
+                    price: priceEl ? priceEl.innerText.trim() : null,
+                    old_price: oldPriceEl ? oldPriceEl.innerText.trim() : null,
+                    image: imgEl ? (imgEl.src || imgEl.content) : null
+                });
+            """
+            result = await self.browser.execute_js(script)
+            if not result:
+                return None
+            try:
+                data = json.loads(result) if isinstance(result, str) else result
+                return {
+                    "name": data.get("name") or "Неизвестно",
+                    "price": self._clean_price(data.get("price")),
+                    "old_price": self._clean_price(data.get("old_price")),
+                    "image": data.get("image") or "",
+                    "url": url,
+                    "source": "lamoda",
+                }
+            except Exception:
+                return None
+        except Exception as e:
+            print(f"[LamodaParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.browser.close()
+
+
+=== ФАЙЛ 7: parsers/sbermegamarket.py (создать) ===
+
+import re
+import asyncio
+from typing import Optional, Dict
+from .browserwing_client import BrowserWingClient
+
+
+class SberMegaMarketParser:
+    PATTERNS = [
+        r"https?://(?:www\.)?sbermegamarket\.ru/.*",
+    ]
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=6.0)
+            if not ok:
+                return None
+
+            script = """
+                const nameEl = document.querySelector('h1') || document.querySelector('div[itemprop="name"]');
+                const priceEl = document.querySelector('span[itemprop="price"]') || document.querySelector('div.product-price') || document.querySelector('span');
+                const imgEl = document.querySelector('img[itemprop="image"]') || document.querySelector('meta[property="og:image"]');
+                return JSON.stringify({
+                    name: nameEl ? nameEl.innerText.trim() : null,
+                    price: priceEl ? priceEl.innerText.trim() : null,
+                    image: imgEl ? (imgEl.src || imgEl.content) : null
+                });
+            """
+            result = await self.browser.execute_js(script)
+            if not result:
+                return None
+            try:
+                data = json.loads(result) if isinstance(result, str) else result
+                return {
+                    "name": data.get("name") or "Неизвестно",
+                    "price": self._clean_price(data.get("price")),
+                    "old_price": None,
+                    "image": data.get("image") or "",
+                    "url": url,
+                    "source": "sbermegamarket",
+                }
+            except Exception:
+                return None
+        except Exception as e:
+            print(f"[SberMegaMarketParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.browser.close()
+
+
+=== ФАЙЛ 8: parsers/aliexpress.py (создать) ===
+
+import re
+import asyncio
+from typing import Optional, Dict
+from .browserwing_client import BrowserWingClient
+
+
+class AliExpressParser:
+    PATTERNS = [
+        r"https?://(?:www\.)?aliexpress\.(ru|com)/.*",
+    ]
+
+    def __init__(self):
+        self.browser = BrowserWingClient()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        try:
+            ok = await self.browser.navigate(url, wait=8.0)
+            if not ok:
+                return None
+
+            # Скролл для загрузки контента
+            await self.browser.execute_js("window.scrollTo(0, document.body.scrollHeight / 2);")
+            await asyncio.sleep(2)
+
+            script = """
+                const nameEl = document.querySelector('h1') || document.querySelector('div[data-pl="product-title"]') || document.querySelector('h1.title');
+                const priceEl = document.querySelector('span.price') || document.querySelector('div.product-price-current') || document.querySelector('[class*="price"] span');
+                const imgEl = document.querySelector('img.magnifier-image') || document.querySelector('meta[property="og:image"]') || document.querySelector('img[class*="image"]');
+                return JSON.stringify({
+                    name: nameEl ? nameEl.innerText.trim() : null,
+                    price: priceEl ? priceEl.innerText.trim() : null,
+                    image: imgEl ? (imgEl.src || imgEl.content) : null
+                });
+            """
+            result = await self.browser.execute_js(script)
+            if not result:
+                return None
+            try:
+                data = json.loads(result) if isinstance(result, str) else result
+                return {
+                    "name": data.get("name") or "Неизвестно",
+                    "price": self._clean_price(data.get("price")),
+                    "old_price": None,
+                    "image": data.get("image") or "",
+                    "url": url,
+                    "source": "aliexpress",
+                }
+            except Exception:
+                return None
+        except Exception as e:
+            print(f"[AliExpressParser] Ошибка: {e}")
+            return None
+        finally:
+            await self.browser.close()
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.browser.close()
+
+
+=== ФАЙЛ 9: parsers/factory.py (создать) ===
+
+from typing import Optional
+from .ozon import OzonParser
+from .wildberries import WildberriesParser
+from .yandex_market import YandexMarketParser
+from .lamoda import LamodaParser
+from .sbermegamarket import SberMegaMarketParser
+from .aliexpress import AliExpressParser
+from .universal_browser_parser import UniversalBrowserParser
+
+
+PARSERS = [
+    OzonParser,
+    WildberriesParser,
+    YandexMarketParser,
+    LamodaParser,
+    SberMegaMarketParser,
+    AliExpressParser,
+]
+
+def get_parser(url: str):
+    for ParserClass in PARSERS:
+        p = ParserClass()
+        if p.is_valid(url):
+            return p
+    return UniversalBrowserParser()
+
+
+=== ФАЙЛ 10: parsers/__init__.py (создать или перезаписать) ===
+
+from .factory import get_parser
+from .ozon import OzonParser
+from .wildberries import WildberriesParser
+from .yandex_market import YandexMarketParser
+from .lamoda import LamodaParser
+from .sbermegamarket import SberMegaMarketParser
+from .aliexpress import AliExpressParser
+from .universal_browser_parser import UniversalBrowserParser
+
+__all__ = [
+    "get_parser",
+    "OzonParser",
+    "WildberriesParser",
+    "YandexMarketParser",
+    "LamodaParser",
+    "SberMegaMarketParser",
+    "AliExpressParser",
+    "UniversalBrowserParser",
+]
+
+
+=== ФАЙЛ 11: exporters/excel_exporter.py (создать) ===
+
+import os
+from typing import List, Dict, Optional
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+class ExcelExporter:
+    """Экспорт результатов парсинга в Excel (.xlsx)."""
+
+    def __init__(self, output_path: str = "results.xlsx"):
+        self.output_path = output_path
+
+    def export(self, data: List[Dict], sheet_name: str = "Парсинг") -> str:
+        """
+        data — список словарей с ключами: name, price, old_price, image, url, source
+        Возвращает путь к созданному файлу.
+        """
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet_name
+
+        # Заголовки
+        headers = ["Название", "Цена", "Старая цена", "Изображение", "URL", "Источник"]
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=12)
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+
+        # Данные
+        for row_num, item in enumerate(data, 2):
+            row_data = [
+                item.get("name", ""),
+                item.get("price", ""),
+                item.get("old_price", "") or "",
+                item.get("image", ""),
+                item.get("url", ""),
+                item.get("source", ""),
+            ]
+            for col_num, value in enumerate(row_data, 1):
+                cell = ws.cell(row=row_num, column=col_num, value=value)
+                cell.border = thin_border
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+                if col_num == 2 and value:
+                    cell.number_format = '#,##0 "₽"'
+
+        # Автоширина колонок
+        for col in range(1, len(headers) + 1):
+            max_length = 0
+            column = get_column_letter(col)
+            for row in ws.iter_rows(min_col=col, max_col=col):
+                for cell in row:
+                    try:
+                        if cell.value:
+                            max_length = max(max_length, len(str(cell.value)))
+                    except:
+                        pass
+            adjusted_width = min(max_length + 2, 60)
+            ws.column_dimensions[column].width = adjusted_width
+
+        # Фиксация заголовка
+        ws.freeze_panes = "A2"
+
+        # Автофильтр
+        ws.auto_filter.ref = ws.dimensions
+
+        wb.save(self.output_path)
+        return os.path.abspath(self.output_path)
+
+
+=== ФАЙЛ 12: exporters/google_sheets_exporter.py (создать) ===
+
+import os
+from typing import List, Dict, Optional
+import gspread
+from gspread.utils import rowcol_to_a1
+from google.oauth2.service_account import Credentials
+
+
+class GoogleSheetsExporter:
+    """Экспорт результатов парсинга в Google Sheets."""
+
+    SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    def __init__(self, credentials_path: str = "google_credentials.json"):
+        self.credentials_path = credentials_path
+        self.client = None
+
+    def _get_client(self) -> gspread.Client:
+        if self.client is None:
+            if not os.path.exists(self.credentials_path):
+                raise FileNotFoundError(
+                    f"Файл credentials не найден: {self.credentials_path}. "
+                    "Создай Service Account в Google Cloud Console, скачай JSON-ключ и положи в проект."
+                )
+            creds = Credentials.from_service_account_file(self.credentials_path, scopes=self.SCOPES)
+            self.client = gspread.authorize(creds)
+        return self.client
+
+    def export(self, data: List[Dict], spreadsheet_name: str = "PricePulse Results") -> str:
+        """
+        Создаёт Google-таблицу, заполняет данными и возвращает URL.
+        """
+        client = self._get_client()
+
+        # Создаём таблицу
+        spreadsheet = client.create(spreadsheet_name)
+        worksheet = spreadsheet.sheet1
+        worksheet.title = "Парсинг"
+
+        # Заголовки
+        headers = ["Название", "Цена", "Старая цена", "Изображение", "URL", "Источник"]
+        worksheet.append_row(headers)
+
+        # Форматирование заголовков
+        worksheet.format("A1:F1", {
+            "textFormat": {"bold": True, "fontSize": 12},
+            "backgroundColor": {"red": 0.21, "green": 0.38, "blue": 0.57},
+            "horizontalAlignment": "CENTER",
+        })
+
+        # Данные
+        for item in data:
+            row = [
+                item.get("name", ""),
+                item.get("price", "") if item.get("price") is not None else "",
+                item.get("old_price", "") if item.get("old_price") is not None else "",
+                item.get("image", ""),
+                item.get("url", ""),
+                item.get("source", ""),
+            ]
+            worksheet.append_row(row)
+
+        # Автоширина (примерная)
+        worksheet.columns_auto_resize(0, 5)
+
+        # Публичный доступ (опционально — можно убрать)
+        spreadsheet.share("", perm_type="anyone", role="reader")
+
+        return spreadsheet.url
+
+
+=== ФАЙЛ 13: exporters/__init__.py (создать) ===
+
+from .excel_exporter import ExcelExporter
+from .google_sheets_exporter import GoogleSheetsExporter
+
+__all__ = ["ExcelExporter", "GoogleSheetsExporter"]
+
+
+=== ФАЙЛ 14: config.py (создать в корне проекта) ===
+
+import os
+
+# Путь к Google Service Account credentials
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "google_credentials.json")
+
+# Путь к Excel-файлу по умолчанию
+EXCEL_OUTPUT_PATH = os.getenv("EXCEL_OUTPUT_PATH", "results.xlsx")
+
+# Имя Google-таблицы по умолчанию
+GOOGLE_SHEETS_NAME = os.getenv("GOOGLE_SHEETS_NAME", "PricePulse Results")
+
+
+=== ФАЙЛ 15: requirements.txt (перезаписать или дополнить) ===
+
+httpx>=0.24.0
+openpyxl>=3.1.0
+gspread>=6.0.0
+google-auth>=2.0.0
+
+
+=== ТРЕБОВАНИЯ ===
+1. Все файлы парсеров должны лежать в папке C:\projects\pricepulse\parsers\
+2. Файлы exporters — в C:\projects\pricepulse\exporters\
+3. Каждый парсер имеет: is_valid(url), parse(url), close()
+4. Все методы parse асинхронные (async def)
+5. Цена всегда int (рубли, без копеек) или None
+6. old_price — int или None
+7. image — строка URL или пустая строка
+8. source — строковый идентификатор
+9. В finally каждого parse вызывать await self.browser.close()
+10. ExcelExporter создаёт красивый .xlsx с заголовками, границами, автошириной, фильтром и фиксацией заголовка
+11. GoogleSheetsExporter создаёт Google-таблицу через Service Account, заполняет данными, форматирует заголовок, возвращает URL
+12. Между запросами в тесте делать await asyncio.sleep(2)
+
+=== ТЕСТ (создай test_parsers.py в C:\projects\pricepulse\ и запусти) ===
+
+import asyncio
+import os
+from parsers.factory import get_parser
+from exporters.excel_exporter import ExcelExporter
+from exporters.google_sheets_exporter import GoogleSheetsExporter
+import config
+
+async def test():
+    urls = [
+        "https://ozon.ru/t/V22UySC",
+        "https://www.wildberries.ru/catalog/123456/detail.aspx",
+        "https://market.yandex.ru/product--smartfon-apple-iphone-15/12345",
+        "https://www.lamoda.ru/p/mp002xw08qlo/clothes-acoola-tolstovka/",
+        "https://sbermegamarket.ru/catalog/details/smartfon-xiaomi-123/",
+        "https://aliexpress.ru/item/1005001234567890.html",
+    ]
+
+    results = []
+    for url in urls:
+        print(f"\n=== Тест: {url} ===")
+        try:
+            p = get_parser(url)
+            print(f"Выбран парсер: {type(p).__name__}")
+            r = await p.parse(url)
+            print(f"Результат: {r}")
+            if r:
+                results.append(r)
+            await p.close()
+        except Exception as e:
+            print(f"Ошибка теста: {e}")
+        await asyncio.sleep(2)
+
+    # Экспорт в Excel
+    if results:
+        print("\n=== Экспорт в Excel ===")
+        excel = ExcelExporter(output_path=config.EXCEL_OUTPUT_PATH)
+        path = excel.export(results)
+        print(f"Excel сохранён: {path}")
+
+        # Экспорт в Google Sheets (если есть credentials)
+        creds_path = config.GOOGLE_CREDENTIALS_PATH
+        if os.path.exists(creds_path):
+            print("\n=== Экспорт в Google Sheets ===")
+            try:
+                gs = GoogleSheetsExporter(credentials_path=creds_path)
+                sheet_url = gs.export(results, spreadsheet_name=config.GOOGLE_SHEETS_NAME)
+                print(f"Google Sheets создана: {sheet_url}")
+            except Exception as e:
+                print(f"Ошибка Google Sheets: {e}")
+        else:
+            print(f"\n[Пропуск Google Sheets] Файл credentials не найден: {creds_path}")
+            print("Инструкция: создай Service Account в https://console.cloud.google.com/")
+            print("Скачай JSON-ключ, переименуй в google_credentials.json и положи в C:\\projects\\pricepulse\\")
+    else:
+        print("Нет данных для экспорта.")
+
+if __name__ == "__main__":
+    asyncio.run(test())
+
+Покажи полный вывод теста. Если какой-то URL не открывается или пустой — напиши, какой именно и что вывело ошибка.

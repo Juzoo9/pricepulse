@@ -1,0 +1,106 @@
+Проект: C:\projects\pricepulse
+Задача: добавить обработку статуса "нет в наличии" (out_of_stock) во ВСЕ парсеры и в Telegram-бот. Если товара нет — парсер возвращает ошибку out_of_stock, а бот отправляет красивое сообщение пользователю.
+
+=== ШАГ 1: Найти структуру бота ===
+
+Выполнить команду:
+dir bot\ /s /b
+
+Найти файлы, которые содержат:
+- отправку сообщений с ценой (message.answer, bot.send_message)
+- обработку результата парсера (parser.parse)
+- слова "цена", "price", "парсинг", "товар"
+
+Вывести список найденных файлов.
+
+=== ШАГ 2: Обновить все парсеры (out_of_stock) ===
+
+Для КАЖДОГО из файлов parsers/ozon.py, parsers/wildberries.py, parsers/yandex_market.py, parsers/lamoda.py, parsers/sbermegamarket.py, parsers/aliexpress.py, parsers/universal_browser_parser.py:
+
+Найти в методе parse() место ПОСЛЕ получения soup и text, но ДО начала поиска цен. Вставить блок:
+
+        # --- Проверка на отсутствие в наличии ---
+        stock_text = text.lower()
+        out_of_stock_phrases = [
+            "нет в наличии", "out of stock", "распродано", "sold out",
+            "ожидается поступление", "not available", "нет размеров",
+            "временно отсутствует", "закончился", "нет в продаже",
+            "не доступен", "unavailable", "отсутствует", "нет на складе"
+        ]
+        if any(phrase in stock_text for phrase in out_of_stock_phrases):
+            # Пытаемся достать название
+            name = "Неизвестно"
+            meta = soup.find("meta", property="og:title")
+            if meta:
+                name = meta.get("content", "Неизвестно").split('|')[0].strip()
+            if not name or name == "Неизвестно":
+                h1 = soup.find("h1")
+                if h1:
+                    name = h1.get_text(strip=True)
+            return {
+                "error": "out_of_stock",
+                "name": name,
+                "url": url,
+                "source": "<SOURCE_NAME>",  # ozon / wildberries / lamoda и т.д.
+                "price": None,
+                "price_card": None,
+                "old_price": None,
+                "image": ""
+            }
+
+ВАЖНО: <SOURCE_NAME> заменить на правильное имя источника для каждого парсера.
+
+=== ШАГ 3: Обновить Telegram-бот ===
+
+Найти файл(ы) в папке bot/, где обрабатывается результат парсинга (где вызывается parser.parse() и дальше формируется сообщение с ценой).
+
+В самое начало обработки результата (сразу после получения result = await parser.parse(url)) вставить:
+
+        if isinstance(result, dict) and result.get("error") == "out_of_stock":
+            name = result.get("name", "Товар")
+            source_display = {
+                "ozon": "Ozon",
+                "wildberries": "Wildberries",
+                "yandex_market": "Яндекс.Маркет",
+                "lamoda": "Lamoda",
+                "sbermegamarket": "СберМегаМаркет",
+                "aliexpress": "AliExpress",
+                "universal": "Сайт"
+            }.get(result.get("source", ""), "Сайт")
+            
+            await message.answer(
+                f"📭 <b>{name}</b>\n\n"
+                f"❌ Товар временно отсутствует в продаже на <b>{source_display}</b>.\n"
+                f"🔗 <a href='{result['url']}'>Посмотреть на сайте</a>\n\n"
+                f"🔔 Мы уведомим, когда товар снова появится.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
+Если в боте используется не message.answer, а bot.send_message или другой метод — адаптировать под существующий метод.
+
+Если есть callback-обработчики (inline кнопки) — добавить такую же проверку туда.
+
+=== ШАГ 4: Обновить test_anticaptcha.py ===
+
+В функции test(), в блоке обработки результатов, ДО проверки success добавить:
+
+            elif isinstance(r, dict) and r.get("error") == "out_of_stock":
+                stats["success"] += 1
+                name = r.get('name', 'N/A')[:45]
+                print(f"      📭 НЕТ В НАЛИЧИИ: {name} ({elapsed:.1f}с)")
+
+=== ШАГ 5: Проверка ===
+
+Запустить test_anticaptcha.py и показать полный вывод. Убедиться, что:
+1. Все парсеры прошли синтаксис
+2. Товары "нет в наличии" отображаются как 📭 НЕТ В НАЛИЧИИ
+3. Остальные товары показывают цены
+
+=== ТРЕБОВАНИЯ ===
+1. Все 6 парсеров + universal проверяют текст на фразы out_of_stock
+2. Бот отправляет красивое HTML-сообщение с 📭 и ссылкой на сайт
+3. Бот НЕ пытается показать цены для out_of_stock товара
+4. Тест корректно отображает статус
+5. Вывести список всех изменённых файлов в конце

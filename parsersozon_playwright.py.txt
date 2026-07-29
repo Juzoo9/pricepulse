@@ -1,0 +1,29 @@
+from parsers.base import BaseParser
+from playwright.async_api import async_playwright
+
+
+class OzonPlaywrightParser(BaseParser):
+    async def is_valid(self, url: str) -> bool:
+        return "ozon.ru" in url
+
+    async def parse(self, url: str) -> dict:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            
+            title = await page.locator("h1").first.inner_text()
+            
+            # Ищем цену по data-атрибутам Ozon
+            price_el = await page.locator('[data-widget="webPrice"]').first
+            price = await price_el.inner_text() if price_el else "Не найдена"
+            
+            await browser.close()
+            
+            return {
+                "title": title,
+                "price": price.replace("₽", "").strip(),
+                "currency": "₽",
+                "image_url": ""
+            }

@@ -1,0 +1,919 @@
+Проект: C:\projects\pricepulse
+Задача: полностью заменить BrowserWing на собственный Browser Proxy. Реальный Chrome проходит защиту, парсеры получают HTML через BeautifulSoup.
+
+=== ФАЙЛ 1: requirements.txt (перезаписать) ===
+
+httpx>=0.24.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+aiogram>=3.0.0
+openpyxl>=3.1.0
+gspread>=5.10.0
+python-dotenv>=1.0.0
+
+
+=== ФАЙЛ 2: browser_proxy/queue_manager.py (создать) ===
+
+import asyncio
+import time
+from collections import deque
+from typing import Optional, Dict
+
+
+class QueueManager:
+    def __init__(self, default_timeout: float = 45.0):
+        self.pending = deque()
+        self.processing = {}
+        self.results = {}
+        self.events = {}
+        self.lock = asyncio.Lock()
+        self.default_timeout = default_timeout
+
+    async def submit(self, url: str, timeout: Optional[float] = None) -> Dict:
+        timeout = timeout or self.default_timeout
+        async with self.lock:
+            if url in self.results:
+                return {"status": "ok", "html": self.results.pop(url)}
+
+            task = {"url": url, "submitted_at": time.time()}
+            self.pending.append(task)
+            event = asyncio.Event()
+            self.events[url] = event
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            async with self.lock:
+                html = self.results.pop(url, None)
+            if html:
+                return {"status": "ok", "html": html}
+            return {"status": "error", "detail": "empty result"}
+        except asyncio.TimeoutError:
+            async with self.lock:
+                self.events.pop(url, None)
+                self.pending = deque([t for t in self.pending if t["url"] != url])
+                self.processing.pop(url, None)
+            return {"status": "error", "detail": "timeout"}
+
+    async def get_task(self) -> Optional[Dict]:
+        async with self.lock:
+            while self.pending:
+                task = self.pending.popleft()
+                if time.time() - task["submitted_at"] > 60:
+                    continue
+                self.processing[task["url"]] = time.time()
+                return {"url": task["url"]}
+            return None
+
+    async def set_result(self, url: str, html: str):
+        async with self.lock:
+            self.results[url] = html
+            event = self.events.pop(url, None)
+            if event:
+                event.set()
+            self.processing.pop(url, None)
+
+
+=== ФАЙЛ 3: browser_proxy/main.py (создать) ===
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+from .queue_manager import QueueManager
+
+app = FastAPI(title="PricePulse Browser Proxy")
+qm = QueueManager()
+
+
+class ResultPayload(BaseModel):
+    url: str
+    html: str
+
+
+@app.post("/load")
+async def load_url(url: str, timeout: float = 45.0):
+    result = await qm.submit(url, timeout)
+    if result["status"] == "ok":
+        return {"status": "success", "html": result["html"]}
+    raise HTTPException(status_code=408, detail=result.get("detail", "timeout"))
+
+
+@app.get("/task")
+async def get_task():
+    task = await qm.get_task()
+    if not task:
+        raise HTTPException(status_code=204, detail="No tasks")
+    return task
+
+
+@app.post("/result")
+async def set_result(data: ResultPayload):
+    await qm.set_result(data.url, data.html)
+    return {"status": "ok"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "pending": len(qm.pending), "processing": len(qm.processing)}
+
+
+=== ФАЙЛ 4: browser_proxy/__init__.py (создать) ===
+
+# Browser Proxy package
+
+
+=== ФАЙЛ 5: browser_extension/manifest.json (создать) ===
+
+{
+  "manifest_version": 3,
+  "name": "PricePulse Browser Proxy",
+  "version": "1.0",
+  "description": "Real Chrome proxy for bypassing bot protection",
+  "permissions": ["tabs", "scripting", "alarms", "background"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
+
+
+=== ФАЙЛ 6: browser_extension/background.js (создать) ===
+
+const PROXY_URL = 'http://localhost:8000';
+
+// Keep-alive через alarms (V3)
+chrome.alarms.create('poll', { periodInMinutes: 0.166 }); // каждые 10 сек
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'poll') return;
+  await pollTask();
+});
+
+async function pollTask() {
+  try {
+    const resp = await fetch(`${PROXY_URL}/task`);
+    if (resp.status === 204) return;
+    const task = await resp.json();
+    if (!task || !task.url) return;
+
+    console.log('[Extension] Получена задача:', task.url);
+
+    // Открываем вкладку
+    const tab = await chrome.tabs.create({ url: task.url, active: false });
+
+    // Ждём полной загрузки
+    await new Promise((resolve) => {
+      const listener = (tabId, info) => {
+        if (tabId === tab.id && info.status === 'complete') {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+
+    // Даём время на прохождение challenge (Cloudflare/SmartCaptcha)
+    await sleep(8000);
+
+    // Получаем HTML
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => document.documentElement.outerHTML
+    });
+
+    // Отправляем результат
+    await fetch(`${PROXY_URL}/result`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: task.url, html: result })
+    });
+
+    console.log('[Extension] Результат отправлен:', task.url);
+
+    // Закрываем вкладку
+    await chrome.tabs.remove(tab.id);
+
+  } catch (e) {
+    console.error('[Extension] Ошибка:', e);
+  }
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+
+=== ФАЙЛ 7: browser_extension/icon16.png, icon48.png, icon128.png ===
+# Создать пустые PNG-заглушки или скопировать любые существующие иконки.
+# Если нет — можно создать пустые файлы, Chrome не упадёт.
+
+
+=== ФАЙЛ 8: parsers/browser_proxy_client.py (создать) ===
+
+import httpx
+from typing import Optional
+
+
+class BrowserProxyClient:
+    """Клиент для Browser Proxy (реальный Chrome)."""
+
+    def __init__(self, base_url: str = "http://localhost:8000"):
+        self.client = httpx.AsyncClient(base_url=base_url, timeout=60.0)
+
+    async def get_html(self, url: str, timeout: float = 45.0) -> str:
+        resp = await self.client.post("/load", params={"url": url, "timeout": timeout})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "success":
+            return data.get("html", "")
+        return ""
+
+    async def close(self):
+        await self.client.aclose()
+
+
+=== ФАЙЛ 9: parsers/ozon.py (перезаписать полностью) ===
+
+import re
+import json
+from typing import Optional, Dict
+from bs4 import BeautifulSoup
+from .browser_proxy_client import BrowserProxyClient
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+class OzonParser:
+    PATTERNS = [r"https?://(?:www\.)?ozon\.ru/.*", r"https?://(?:www\.)?ozon\.ru/t/.*"]
+
+    def __init__(self, notifier: Optional[CaptchaNotifier] = None):
+        self.client = BrowserProxyClient()
+        self.notifier = notifier or CaptchaNotifier()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        html = await self.client.get_html(url)
+        if not html:
+            return {"error": "empty_html", "url": url, "source": "ozon"}
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        # Проверка на блокировку
+        title = (soup.title.string or "").lower() if soup.title else ""
+        text = soup.get_text(separator=" ", strip=True).lower()
+        if any(x in title for x in ["captcha", "капча", "ddos", "access denied", "just a moment"]):
+            await self.notifier.notify(url, f"title: {title[:100]}", "ozon")
+            return {"error": "captcha", "captcha_type": title[:100], "url": url, "source": "ozon"}
+
+        # JSON-LD
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and data.get("@type") == "Product":
+                    return self._from_jsonld(data, url)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("@type") == "Product":
+                            return self._from_jsonld(item, url)
+            except Exception:
+                continue
+
+        # NUXT fallback
+        for script in soup.find_all("script"):
+            if script.string and "window.__NUXT__" in script.string:
+                try:
+                    # Найти JSON после =
+                    match = re.search(r'window\.__NUXT__\s*=\s*({.+?});?</script>', html, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group(1))
+                        product = self._find_in_state(data)
+                        if product:
+                            return {
+                                "name": product.get("name", product.get("title", "Неизвестно")),
+                                "price": self._clean_price(product.get("price") or product.get("finalPrice")),
+                                "old_price": self._clean_price(product.get("oldPrice") or product.get("originalPrice")),
+                                "image": product.get("image", product.get("coverImage", "")),
+                                "url": url,
+                                "source": "ozon",
+                            }
+                except Exception:
+                    continue
+
+        # DOM fallback
+        name_el = soup.find("h1")
+        price_el = soup.find("span", {"data-testid": "price"}) or soup.find("span", string=re.compile(r"\d"))
+        old_price_el = soup.find("span", {"data-testid": "old-price"})
+        img_el = soup.find("img", {"data-testid": "image"}) or soup.find("img")
+
+        return {
+            "name": name_el.get_text(strip=True) if name_el else "Неизвестно",
+            "price": self._clean_price(price_el.get_text(strip=True) if price_el else None),
+            "old_price": self._clean_price(old_price_el.get_text(strip=True) if old_price_el else None),
+            "image": img_el.get("src", "") if img_el else "",
+            "url": url,
+            "source": "ozon",
+        }
+
+    def _from_jsonld(self, data: dict, url: str) -> Dict:
+        offers = data.get("offers", {})
+        if isinstance(offers, list) and offers:
+            offers = offers[0]
+        elif not isinstance(offers, dict):
+            offers = {}
+        img = data.get("image", "")
+        if isinstance(img, list) and img:
+            img = img[0]
+        return {
+            "name": data.get("name", "Неизвестно"),
+            "price": self._clean_price(offers.get("price")),
+            "old_price": self._clean_price(offers.get("highPrice")),
+            "image": img or "",
+            "url": data.get("url", url),
+            "source": "ozon",
+        }
+
+    def _find_in_state(self, obj):
+        if not isinstance(obj, dict):
+            return None
+        if "name" in obj and ("price" in obj or "finalPrice" in obj):
+            return obj
+        for v in obj.values():
+            if isinstance(v, dict):
+                found = self._find_in_state(v)
+                if found:
+                    return found
+            elif isinstance(v, list):
+                for item in v:
+                    found = self._find_in_state(item)
+                    if found:
+                        return found
+        return None
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.client.close()
+
+
+=== ФАЙЛ 10: parsers/wildberries.py (перезаписать полностью) ===
+
+import re
+import json
+from typing import Optional, Dict
+from bs4 import BeautifulSoup
+from .browser_proxy_client import BrowserProxyClient
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+class WildberriesParser:
+    PATTERNS = [
+        r"https?://(?:www\.)?wildberries\.ru/catalog/\d+/detail\.aspx.*",
+        r"https?://(?:www\.)?wildberries\.ru/.*",
+    ]
+
+    def __init__(self, notifier: Optional[CaptchaNotifier] = None):
+        self.client = BrowserProxyClient()
+        self.notifier = notifier or CaptchaNotifier()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        html = await self.client.get_html(url)
+        if not html:
+            return {"error": "empty_html", "url": url, "source": "wildberries"}
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        title = (soup.title.string or "").lower() if soup.title else ""
+        if any(x in title for x in ["captcha", "капча", "ddos", "access denied"]):
+            await self.notifier.notify(url, f"title: {title[:100]}", "wildberries")
+            return {"error": "captcha", "captcha_type": title[:100], "url": url, "source": "wildberries"}
+
+        # Пробуем window.__INITIAL_STATE__
+        for script in soup.find_all("script"):
+            if script.string and "window.__INITIAL_STATE__" in script.string:
+                try:
+                    match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.+?});?</script>', html, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group(1))
+                        p = data.get("catalog", {}).get("product", {})
+                        if p:
+                            price_raw = p.get("salePriceU") or p.get("price") or p.get("priceU")
+                            price = int(price_raw) / 100 if price_raw else None
+                            old_raw = p.get("priceU") or p.get("oldPrice")
+                            old_price = int(old_raw) / 100 if old_raw else None
+                            return {
+                                "name": p.get("name", p.get("goodsName", "Неизвестно")),
+                                "price": price,
+                                "old_price": old_price,
+                                "image": p.get("image", ""),
+                                "url": url,
+                                "source": "wildberries",
+                            }
+                except Exception:
+                    continue
+
+        # DOM fallback
+        name_el = soup.find("h1") or soup.find(class_=re.compile("product-page__title"))
+        price_el = soup.find(class_=re.compile("price-block__final-price"))
+        img_el = soup.find("img", class_=re.compile("photo-zoom__preview")) or soup.find("img")
+
+        return {
+            "name": name_el.get_text(strip=True) if name_el else "Неизвестно",
+            "price": self._clean_price(price_el.get_text(strip=True) if price_el else None),
+            "old_price": None,
+            "image": img_el.get("src", "") if img_el else "",
+            "url": url,
+            "source": "wildberries",
+        }
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.client.close()
+
+
+=== ФАЙЛ 11: parsers/yandex_market.py (перезаписать полностью) ===
+
+import re
+from typing import Optional, Dict
+from bs4 import BeautifulSoup
+from .browser_proxy_client import BrowserProxyClient
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+class YandexMarketParser:
+    PATTERNS = [r"https?://(?:www\.)?market\.yandex\.ru/.*"]
+
+    def __init__(self, notifier: Optional[CaptchaNotifier] = None):
+        self.client = BrowserProxyClient()
+        self.notifier = notifier or CaptchaNotifier()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        html = await self.client.get_html(url)
+        if not html:
+            return {"error": "empty_html", "url": url, "source": "yandex_market"}
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        title = (soup.title.string or "").lower() if soup.title else ""
+        if any(x in title for x in ["captcha", "капча", "smartcaptcha", "ddos"]):
+            await self.notifier.notify(url, f"title: {title[:100]}", "yandex_market")
+            return {"error": "captcha", "captcha_type": title[:100], "url": url, "source": "yandex_market"}
+
+        name_el = soup.find("h1", {"data-auto": "productCardTitle"}) or soup.find("h1")
+        price_el = soup.find("span", {"data-auto": "mainPrice"}) or soup.find("div", {"data-auto": "price"})
+        img_el = soup.find("img", {"data-auto": "image"}) or soup.find("div", {"data-auto": "gallery"})
+
+        return {
+            "name": name_el.get_text(strip=True) if name_el else "Неизвестно",
+            "price": self._clean_price(price_el.get_text(strip=True) if price_el else None),
+            "old_price": None,
+            "image": img_el.get("src", "") if img_el else "",
+            "url": url,
+            "source": "yandex_market",
+        }
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.client.close()
+
+
+=== ФАЙЛ 12: parsers/lamoda.py (перезаписать полностью) ===
+
+import re
+from typing import Optional, Dict
+from bs4 import BeautifulSoup
+from .browser_proxy_client import BrowserProxyClient
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+class LamodaParser:
+    PATTERNS = [r"https?://(?:www\.)?lamoda\.ru/.*"]
+
+    def __init__(self, notifier: Optional[CaptchaNotifier] = None):
+        self.client = BrowserProxyClient()
+        self.notifier = notifier or CaptchaNotifier()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        html = await self.client.get_html(url)
+        if not html:
+            return {"error": "empty_html", "url": url, "source": "lamoda"}
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        title = (soup.title.string or "").lower() if soup.title else ""
+        if any(x in title for x in ["captcha", "капча", "проверка"]):
+            await self.notifier.notify(url, f"title: {title[:100]}", "lamoda")
+            return {"error": "captcha", "captcha_type": title[:100], "url": url, "source": "lamoda"}
+
+        name_el = soup.find("h1", class_="product-title") or soup.find("h1")
+        price_el = soup.find("span", class_="price") or soup.find("div", class_="product-prices__price") or soup.find("span", itemprop="price")
+        old_price_el = soup.find("span", class_="price__old") or soup.find("div", class_="product-prices__price-old")
+        img_el = soup.find("img", class_="product-gallery__image") or soup.find("meta", property="og:image")
+
+        return {
+            "name": name_el.get_text(strip=True) if name_el else "Неизвестно",
+            "price": self._clean_price(price_el.get_text(strip=True) if price_el else None),
+            "old_price": self._clean_price(old_price_el.get_text(strip=True) if old_price_el else None),
+            "image": img_el.get("src") if img_el and img_el.name == "img" else (img_el.get("content") if img_el else ""),
+            "url": url,
+            "source": "lamoda",
+        }
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.client.close()
+
+
+=== ФАЙЛ 13: parsers/sbermegamarket.py (перезаписать полностью) ===
+
+import re
+from typing import Optional, Dict
+from bs4 import BeautifulSoup
+from .browser_proxy_client import BrowserProxyClient
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+class SberMegaMarketParser:
+    PATTERNS = [r"https?://(?:www\.)?sbermegamarket\.ru/.*"]
+
+    def __init__(self, notifier: Optional[CaptchaNotifier] = None):
+        self.client = BrowserProxyClient()
+        self.notifier = notifier or CaptchaNotifier()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        html = await self.client.get_html(url)
+        if not html:
+            return {"error": "empty_html", "url": url, "source": "sbermegamarket"}
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        title = (soup.title.string or "").lower() if soup.title else ""
+        if any(x in title for x in ["captcha", "капча", "ddos"]):
+            await self.notifier.notify(url, f"title: {title[:100]}", "sbermegamarket")
+            return {"error": "captcha", "captcha_type": title[:100], "url": url, "source": "sbermegamarket"}
+
+        name_el = soup.find("h1") or soup.find("div", itemprop="name")
+        price_el = soup.find("span", itemprop="price") or soup.find("div", class_=re.compile("product-price"))
+        img_el = soup.find("img", itemprop="image") or soup.find("meta", property="og:image")
+
+        return {
+            "name": name_el.get_text(strip=True) if name_el else "Неизвестно",
+            "price": self._clean_price(price_el.get_text(strip=True) if price_el else None),
+            "old_price": None,
+            "image": img_el.get("src") if img_el and img_el.name == "img" else (img_el.get("content") if img_el else ""),
+            "url": url,
+            "source": "sbermegamarket",
+        }
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.client.close()
+
+
+=== ФАЙЛ 14: parsers/aliexpress.py (перезаписать полностью) ===
+
+import re
+from typing import Optional, Dict
+from bs4 import BeautifulSoup
+from .browser_proxy_client import BrowserProxyClient
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+class AliExpressParser:
+    PATTERNS = [r"https?://(?:www\.)?aliexpress\.(ru|com)/.*"]
+
+    def __init__(self, notifier: Optional[CaptchaNotifier] = None):
+        self.client = BrowserProxyClient()
+        self.notifier = notifier or CaptchaNotifier()
+
+    def is_valid(self, url: str) -> bool:
+        return any(re.match(p, url) for p in self.PATTERNS)
+
+    async def parse(self, url: str) -> Optional[Dict]:
+        html = await self.client.get_html(url)
+        if not html:
+            return {"error": "empty_html", "url": url, "source": "aliexpress"}
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        title = (soup.title.string or "").lower() if soup.title else ""
+        if any(x in title for x in ["captcha", "капча", "ddos", "verify"]):
+            await self.notifier.notify(url, f"title: {title[:100]}", "aliexpress")
+            return {"error": "captcha", "captcha_type": title[:100], "url": url, "source": "aliexpress"}
+
+        name_el = soup.find("h1") or soup.find("div", {"data-pl": "product-title"}) or soup.find("h1", class_="title")
+        price_el = soup.find("span", class_="price") or soup.find("div", class_=re.compile("product-price-current")) or soup.find(string=re.compile(r"\d+\s*₽"))
+        img_el = soup.find("img", class_="magnifier-image") or soup.find("meta", property="og:image") or soup.find("img")
+
+        return {
+            "name": name_el.get_text(strip=True) if name_el else "Неизвестно",
+            "price": self._clean_price(price_el.get_text(strip=True) if price_el else None),
+            "old_price": None,
+            "image": img_el.get("src", "") if img_el else "",
+            "url": url,
+            "source": "aliexpress",
+        }
+
+    def _clean_price(self, raw) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        digits = re.sub(r"[^\d]", "", str(raw))
+        return int(digits) if digits else None
+
+    async def close(self):
+        await self.client.close()
+
+
+=== ФАЙЛ 15: parsers/universal_browser_parser.py (перезаписать полностью) ===
+
+import re
+from typing import Optional, Dict, Any
+from bs4 import BeautifulSoup
+from .browser_proxy_client import BrowserProxyClient
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+class UniversalBrowserParser:
+    def __init__(self, notifier: Optional[CaptchaNotifier] = None):
+        self.client = BrowserProxyClient()
+        self.notifier = notifier or CaptchaNotifier()
+
+    async def parse(self, url: str, selectors: Dict[str, str]) -> Optional[Dict]:
+        html = await self.client.get_html(url)
+        if not html:
+            return {"error": "empty_html", "url": url, "source": "universal"}
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        title = (soup.title.string or "").lower() if soup.title else ""
+        if any(x in title for x in ["captcha", "капча", "ddos", "access denied"]):
+            await self.notifier.notify(url, f"title: {title[:100]}", "universal")
+            return {"error": "captcha", "captcha_type": title[:100], "url": url, "source": "universal"}
+
+        result = {"url": url, "source": "universal"}
+        for field, selector in selectors.items():
+            el = soup.select_one(selector)
+            result[field] = el.get_text(strip=True) if el else "Не найдено"
+
+        for price_field in ["price", "old_price"]:
+            if price_field in result and result[price_field] and result[price_field] != "Не найдено":
+                digits = re.sub(r"[^\d]", "", str(result[price_field]))
+                result[price_field] = int(digits) if digits else None
+            else:
+                result[price_field] = None
+
+        return result
+
+    async def close(self):
+        await self.client.close()
+
+
+=== ФАЙЛ 16: parsers/factory.py (перезаписать полностью) ===
+
+from typing import Optional
+from .ozon import OzonParser
+from .wildberries import WildberriesParser
+from .yandex_market import YandexMarketParser
+from .lamoda import LamodaParser
+from .sbermegamarket import SberMegaMarketParser
+from .aliexpress import AliExpressParser
+from .universal_browser_parser import UniversalBrowserParser
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+PARSERS = [OzonParser, WildberriesParser, YandexMarketParser, LamodaParser, SberMegaMarketParser, AliExpressParser]
+
+def get_parser(url: str, notifier: Optional[CaptchaNotifier] = None):
+    for ParserClass in PARSERS:
+        p = ParserClass(notifier=notifier)
+        if p.is_valid(url):
+            return p
+    return UniversalBrowserParser(notifier=notifier)
+
+
+=== ФАЙЛ 17: parsers/__init__.py (перезаписать) ===
+
+from .factory import get_parser
+from .ozon import OzonParser
+from .wildberries import WildberriesParser
+from .yandex_market import YandexMarketParser
+from .lamoda import LamodaParser
+from .sbermegamarket import SberMegaMarketParser
+from .aliexpress import AliExpressParser
+from .universal_browser_parser import UniversalBrowserParser
+from .browser_proxy_client import BrowserProxyClient
+
+__all__ = [
+    "get_parser",
+    "OzonParser",
+    "WildberriesParser",
+    "YandexMarketParser",
+    "LamodaParser",
+    "SberMegaMarketParser",
+    "AliExpressParser",
+    "UniversalBrowserParser",
+    "BrowserProxyClient",
+]
+
+
+=== ФАЙЛ 18: test_anticaptcha.py (перезаписать полностью) ===
+
+import asyncio
+import time
+from parsers.factory import get_parser
+from bot.services.captcha_notifier import CaptchaNotifier
+
+
+TEST_URLS = [
+    "https://ozon.ru/t/V22UySC",
+    "https://www.wildberries.ru/catalog/123456/detail.aspx",
+    "https://market.yandex.ru/product--smartfon-apple-iphone-15/12345",
+    "https://www.lamoda.ru/p/mp002xw08qlo/clothes-acoola-tolstovka/",
+    "https://sbermegamarket.ru/catalog/details/smartfon-xiaomi-123/",
+    "https://aliexpress.ru/item/1005001234567890.html",
+    "https://www.ozon.ru/product/smartfon-apple-iphone-14-128gb-midnight-1040534597/",
+    "https://www.wildberries.ru/catalog/150033123/detail.aspx",
+    "https://market.yandex.ru/product--naushniki-apple-airpods-pro-2/1234567",
+    "https://www.lamoda.ru/p/to093emgkhk1/clothes-only-sony-tolstovka/",
+]
+
+async def test():
+    print("=" * 70)
+    print("ТЕСТ: Browser Proxy + Real Chrome + BeautifulSoup")
+    print("=" * 70)
+    print("Убедись, что запущены:")
+    print("  1. uvicorn browser_proxy.main:app --port 8000")
+    print("  2. Chrome с загруженным расширением из browser_extension/")
+    print("=" * 70)
+
+    notifier = CaptchaNotifier()
+    stats = {"success": 0, "captcha": 0, "error": 0, "total": len(TEST_URLS)}
+    results = []
+
+    for i, url in enumerate(TEST_URLS, 1):
+        print(f"\n[{i}/{len(TEST_URLS)}] {url}")
+        start = time.time()
+        try:
+            parser = get_parser(url, notifier=notifier)
+            r = await parser.parse(url)
+            elapsed = time.time() - start
+
+            if r is None:
+                stats["error"] += 1
+                print(f"      ❌ None ({elapsed:.1f}с)")
+            elif isinstance(r, dict) and r.get("error") == "captcha":
+                stats["captcha"] += 1
+                print(f"      🛡 КАПЧА: {r.get('captcha_type')} ({elapsed:.1f}с)")
+            elif isinstance(r, dict) and "error" in r:
+                stats["error"] += 1
+                print(f"      ❌ {r['error']} ({elapsed:.1f}с)")
+            else:
+                stats["success"] += 1
+                name = r.get('name', 'N/A')[:50]
+                price = r.get('price', 'N/A')
+                print(f"      ✅ {name} | {price}₽ ({elapsed:.1f}с)")
+                results.append(r)
+
+            await parser.close()
+        except Exception as e:
+            stats["error"] += 1
+            print(f"      ❌ Исключение: {e}")
+
+    print("\n" + "=" * 70)
+    print("ИТОГОВАЯ СТАТИСТИКА")
+    print(f"  Всего URL:   {stats['total']}")
+    print(f"  ✅ Успех:    {stats['success']}")
+    print(f"  🛡 Капча:    {stats['captcha']}")
+    print(f"  ❌ Ошибки:   {stats['error']}")
+    print(f"  Успешность:  {stats['success']/stats['total']*100:.1f}%")
+    print("=" * 70)
+
+    if results:
+        print(f"\nСобрано товаров: {len(results)}")
+        for r in results[:5]:
+            print(f"  • {r.get('name','N/A')[:60]} | {r.get('price','?')}₽ | {r.get('source','')}")
+
+if __name__ == "__main__":
+    asyncio.run(test())
+
+
+=== ФАЙЛ 19: start_browser_proxy.bat (создать) ===
+
+@echo off
+echo ==========================================
+echo  PricePulse Browser Proxy Launcher
+echo ==========================================
+echo.
+
+cd /d C:\projects\pricepulse
+
+echo [1/3] Проверка зависимостей...
+python -c "import fastapi, uvicorn, bs4" 2>nul
+if errorlevel 1 (
+    echo Установка зависимостей...
+    pip install -r requirements.txt
+)
+
+echo [2/3] Запуск FastAPI сервера...
+start "Browser Proxy Server" cmd /k "uvicorn browser_proxy.main:app --host 0.0.0.0 --port 8000 --reload"
+
+echo [3/3] Ожидание сервера...
+timeout /t 3 /nobreak >nul
+
+echo [3/3] Запуск Chrome с расширением...
+start chrome --load-extension="C:\projects\pricepulse\browser_extension" --user-data-dir="C:\projects\pricepulse\chrome_profile" --no-first-run --no-default-browser-check "http://localhost:8000/docs"
+
+echo.
+echo ==========================================
+echo  Готово! Chrome откроется с расширением.
+echo  Не закрывай окна сервера и Chrome.
+echo  Запусти тест: python test_anticaptcha.py
+echo ==========================================
+pause
+
+
+=== ФАЙЛ 20: .gitignore (добавить в конец) ===
+
+# Browser Proxy
+chrome_profile/
+__pycache__/
+*.pyc
+
+
+=== ТРЕБОВАНИЯ ===
+1. ВСЕ парсеры теперь используют BrowserProxyClient вместо BrowserWingClient
+2. BrowserProxyClient ходит на localhost:8000/load и ждёт готовый HTML
+3. Парсеры парсят HTML через BeautifulSoup (lxml)
+4. FastAPI сервер управляет очередью: submit → get_task → set_result
+5. Chrome Extension (Manifest V3) каждые 10 сек опрашивает /task, открывает вкладку, ждёт 8 сек, забирает HTML, отправляет /result, закрывает вкладку
+6. start_browser_proxy.bat запускает сервер и Chrome с расширением
+7. После создания всех файлов:
+   - Установить зависимости: pip install -r requirements.txt
+   - Запустить start_browser_proxy.bat
+   - Дождаться открытия Chrome
+   - Запустить python test_anticaptcha.py
+   - Показать полный вывод теста
+
+=== ИНСТРУКЦИЯ ПОЛЬЗОВАТЕЛЮ (вывести в консоль после создания файлов) ===
+1. Открой Chrome, перейди на chrome://extensions/
+2. Включи "Режим разработчика" (справа сверху)
+3. Нажми "Загрузить распакованное расширение"
+4. Выбери папку C:\projects\pricepulse\browser_extension
+5. Закрой Chrome (полностью, через Ctrl+Shift+Q)
+6. Запусти start_browser_proxy.bat от имени администратора
+7. Chrome откроется с расширением
+8. В новом терминале: cd C:\projects\pricepulse && python test_anticaptcha.py

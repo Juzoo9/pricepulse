@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "PricePulse Browser Proxy",
+  "version": "1.0",
+  "description": "Real Chrome proxy for bypassing bot protection",
+  "permissions": ["tabs", "scripting", "alarms", "background"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

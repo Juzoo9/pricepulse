@@ -26,6 +26,35 @@ class UniversalParser(BaseParser):
 
         soup = BeautifulSoup(html, "html.parser")
 
+        # --- Проверка на отсутствие в наличии ---
+        text = soup.get_text(separator=" ", strip=True)
+        stock_text = text.lower()
+        out_of_stock_phrases = [
+            "нет в наличии", "out of stock", "распродано", "sold out",
+            "ожидается поступление", "not available", "нет размеров",
+            "временно отсутствует", "закончился", "нет в продаже",
+            "не доступен", "unavailable", "отсутствует", "нет на складе"
+        ]
+        if any(phrase in stock_text for phrase in out_of_stock_phrases):
+            name = "Неизвестно"
+            meta = soup.find("meta", property="og:title")
+            if meta:
+                name = meta.get("content", "Неизвестно").split('|')[0].strip()
+            if not name or name == "Неизвестно":
+                h1 = soup.find("h1")
+                if h1:
+                    name = h1.get_text(strip=True)
+            return {
+                "error": "out_of_stock",
+                "name": name,
+                "url": url,
+                "source": "universal",
+                "price": None,
+                "price_card": None,
+                "old_price": None,
+                "image": ""
+            }
+
         title = self._extract_title(soup)
         price = self._extract_price(soup)
         currency = self._extract_currency(soup)
@@ -91,3 +120,24 @@ class UniversalParser(BaseParser):
             return round(float(cleaned), 2)
         except ValueError:
             return 0.0
+async def parse(self, url: str) -> dict:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=HEADERS, timeout=30) as resp:
+                if resp.status == 403:
+                    return {
+                        "title": "Ошибка 403",
+                        "price": "Сайт заблокировал парсер",
+                        "currency": "",
+                        "image_url": ""
+                    }
+                resp.raise_for_status()
+                html = await resp.text()
+                # ... дальше твой код парсинга ...
+    except Exception as e:
+        return {
+            "title": "Ошибка парсинга",
+            "price": str(e),
+            "currency": "",
+            "image_url": ""
+        }
