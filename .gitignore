@@ -1,11 +1,43 @@
-.env
+# Python
 __pycache__/
-*.db
-*.png
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
 .venv/
-node_modules/
-test_*.py
-test_report.txt
 
-# Browser Proxy
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+log/
+
+# Debug / Temp
+debug_*.py
+debug_*.txt
+output.txt
+test_output.txt
+
+# Prompts (OpenCode)
+prompt*.txt
+
+# Chrome
 chrome_profile/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.tmp
+*.bak
