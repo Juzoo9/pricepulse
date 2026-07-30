@@ -1,0 +1,17 @@
+# PricePulse Coding Rules
+
+## Архитектура
+- ВСЕ парсеры: async is_valid(), async parse(), close()=pass
+- parse() возвращает dict с обязательными ключами: name, price, price_card, old_price, image, url, source, error
+- Бот обрабатывает result.get('error') ДО извлечения данных
+
+## Запрещено
+- Менять другие парсеры без спроса
+- Добавлять новые зависимости без согласия
+- Удалять существующий fallback
+- Использовать 'title' вместо 'name'
+
+## Обязательные проверки после изменений
+1. python -m py_compile на изменённом файле
+2. python test_anticaptcha.py (успешность ≥ 80%)
+3. git status — нет неожиданных файлов
