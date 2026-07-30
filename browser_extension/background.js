@@ -32,9 +32,24 @@ async function pollTask() {
     });
 
     // Даём время на прохождение challenge (Cloudflare/SmartCaptcha)
-    await sleep(8000);
+    await sleep(12000);
+
+    // Дополнительная проверка: ждём, пока появится title
+    let attempts = 0;
+    while (attempts < 5) {
+        const [{ result: titleCheck }] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => document.title
+        });
+        if (titleCheck && titleCheck !== '' && !titleCheck.includes('http')) {
+            break;
+        }
+        await sleep(2000);
+        attempts++;
+    }
 
     // Получаем HTML
+    await sleep(2000);
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => document.documentElement.outerHTML

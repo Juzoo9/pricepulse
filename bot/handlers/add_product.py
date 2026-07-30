@@ -26,22 +26,33 @@ async def process_url(message: Message, state: FSMContext):
     try:
         result = await parse_url(url)
 
-        if isinstance(result, dict) and result.get("error") == "out_of_stock":
+        if isinstance(result, dict) and result.get("error"):
+            error = result.get("error")
             name = result.get("name", "Товар")
-            await message.answer(
-                f"\ud83d\udced <b>{name}</b>\n\n"
-                f"Товар временно отсутствует в продаже.\n"
-                f"<a href='{result['url']}'>Посмотреть на сайте</a>",
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
+            if error == "out_of_stock":
+                await message.answer(
+                    f"\U0001f4ed <b>{name}</b>\n\n"
+                    f"Товар временно отсутствует в продаже.\n"
+                    f"<a href='{result['url']}'>Посмотреть на сайте</a>",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            elif error == "captcha":
+                await message.answer(
+                    f"\U0001f6ab Сайт запросил капчу. Вручную откройте ссылку:\n{result['url']}"
+                )
+            else:
+                await message.answer(f"\u274c Ошибка парсинга: {error}")
             await state.clear()
             return
 
+        name = result.get("name", "Неизвестно")
+        price = result.get("price", "?")
+        source = result.get("source", "магазин")
         await message.answer(
             f"Найден товар:\n\n"
-            f"📦 {result['title']}\n"
-            f"💰 {result['price']} {result['currency']}\n\n"
+            f"\U0001f4e6 <b>{name}</b>\n"
+            f"\U0001f4b0 {price} {source}\n\n"
             f"Добавить в отслеживание?"
         )
         await state.set_state(AddProduct.confirm)
